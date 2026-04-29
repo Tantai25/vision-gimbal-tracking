@@ -242,54 +242,34 @@ private:
                 std::vector<Detection> detections;
                 if (!outputs.empty()) {
                     cv::Mat out = outputs[0];
-                    RCLCPP_INFO(this->get_logger(), "Inference output dims: %d, size: %d x %d x %d", 
-                                out.dims, out.size[0], out.size[1], out.size.dims() > 2 ? out.size[2] : 0);
-                    
-                    if (out.dims == 3 && out.size[1] == 84) {
-                        int dims = out.size[1];
-                        int rows = out.size[2];
+                    // YOLO26n output is (1, 300, 6) -> [x1, y1, x2, y2, conf, class]
+                    if (out.dims == 3 && out.size[2] == 6) {
+                        int num_detections = out.size[1];
                         
                         float x_scale = (float)width_ / 640.0;
                         float y_scale = (float)height_ / 640.0;
 
-                        for (int i = 0; i < rows; ++i) {
-                            // Direct indexing to avoid transpose crash
-                            float xc = out.at<float>(0, 0, i);
-                            float yc = out.at<float>(0, 1, i);
-                            float w = out.at<float>(0, 2, i);
-                            float h = out.at<float>(0, 3, i);
+                        for (int i = 0; i < num_detections; ++i) {
+                            float* data = out.ptr<float>(0, i);
+                            float confidence = data[4];
+                            int class_id = (int)data[5];
 
-                            float max_conf = 0;
-                            int class_id = -1;
-                            for (int j = 4; j < dims; ++j) {
-                                float conf = out.at<float>(0, j, i);
-                                if (conf > max_conf) {
-                                    max_conf = conf;
-                                    class_id = j - 4;
-                                }
-                            }
-
-                            if (max_conf >= conf_threshold_) {
-                                float xc = out.at<float>(0, 0, i);
-                                float yc = out.at<float>(0, 1, i);
-                                float w = out.at<float>(0, 2, i);
-                                float h = out.at<float>(0, 3, i);
-
-                                int left = (xc - w/2) * x_scale;
-                                int top = (yc - h/2) * y_scale;
-                                int width = w * x_scale;
-                                int height = h * y_scale;
+                            if (confidence >= conf_threshold_) {
+                                float x1 = data[0] * x_scale;
+                                float y1 = data[1] * y_scale;
+                                float x2 = data[2] * x_scale;
+                                float y2 = data[3] * y_scale;
 
                                 Detection d;
-                                d.box = cv::Rect(left, top, width, height);
-                                d.confidence = max_conf;
+                                d.box = cv::Rect(cv::Point(x1, y1), cv::Point(x2, y2));
+                                d.confidence = confidence;
                                 d.label = (class_id == 0) ? "person" : "object";
                                 detections.push_back(d);
 
                                 geometry_msgs::msg::Point p;
-                                p.x = xc * x_scale;
-                                p.y = yc * y_scale;
-                                p.z = max_conf;
+                                p.x = (x1 + x2) / 2.0;
+                                p.y = (y1 + y2) / 2.0;
+                                p.z = confidence;
                                 target_pub_->publish(p);
                             }
                         }

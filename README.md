@@ -41,14 +41,17 @@ Ensure your Micro XRCE-DDS Agent is running.
 ```
 
 ### 4. Viewing Stream
-On your laptop (100.81.232.35), create `stream.sdp`:
+On your laptop (IP: 100.100.209.42), create a file named `stream.sdp` with the content below, then run the command to receive the stream.
+
+**stream.sdp content:**
 ```text
 v=0
 m=video 5600 RTP/AVP 96
 c=IN IP4 127.0.0.1
 a=rtpmap:96 H264/90000
 ```
-Run:
+
+**Laptop Command:**
 ```bash
 ffplay -protocol_whitelist file,udp,rtp -i stream.sdp -flags low_delay -fflags nobuffer
 ```

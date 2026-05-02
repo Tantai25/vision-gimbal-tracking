@@ -4,6 +4,7 @@
 #include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
+#include <onnxruntime_cxx_api.h>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -32,15 +33,15 @@ struct Detection {
 
 class VisionNode : public rclcpp::Node {
 public:
-    VisionNode() : Node("vision_node") {
-        this->declare_parameter("device", "/dev/video16");
+    VisionNode() : Node("vision_node"), env_(ORT_LOGGING_LEVEL_WARNING, "VisionNode") {
+        this->declare_parameter("device", "/dev/video0");
         this->declare_parameter("width", 640);
         this->declare_parameter("height", 480);
         this->declare_parameter("fps", 30);
-        this->declare_parameter("pixel_format", "YUYV");
-        this->declare_parameter("model_path", "yolo.onnx");
+        this->declare_parameter("pixel_format", "MJPEG");
+        this->declare_parameter("model_path", "yolo26n.onnx");
         this->declare_parameter("conf_threshold", 0.5);
-        this->declare_parameter("rtp_url", "rtp://100.81.232.35:5600");
+        this->declare_parameter("rtp_url", "rtp://100.100.209.42:5600");
 
         device_name_ = this->get_parameter("device").as_string();
         width_ = this->get_parameter("width").as_int();
@@ -58,18 +59,23 @@ public:
             tj_handle_ = tjInitDecompress();
 #endif
         } else {
-            RCLCPP_WARN(this->get_logger(), "Unsupported format, using YUYV");
             pixel_format_ = V4L2_PIX_FMT_YUYV;
         }
 
         std::string model_path = this->get_parameter("model_path").as_string();
+        
+        // Initialize ONNX Runtime
+        Ort::SessionOptions session_options;
+        session_options.SetIntraOpNumThreads(2);
+        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        
         try {
-            net_ = cv::dnn::readNetFromONNX(model_path);
-            net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-            net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-            RCLCPP_INFO(this->get_logger(), "YOLO Model loaded: %s", model_path.c_str());
-        } catch (const cv::Exception& e) {
-            RCLCPP_WARN(this->get_logger(), "Could not load ONNX model. Inference will be skipped. %s", e.what());
+            session_ = std::make_unique<Ort::Session>(env_, model_path.c_str(), session_options);
+            RCLCPP_INFO(this->get_logger(), "ONNX Runtime Session created successfully: %s", model_path.c_str());
+            model_loaded_ = true;
+        } catch (const Ort::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to load ONNX model via ORT: %s", e.what());
+            model_loaded_ = false;
         }
 
         target_pub_ = this->create_publisher<geometry_msgs::msg::Point>("/vision/targets", 10);
@@ -84,19 +90,15 @@ public:
         capture_thread_ = std::thread(&VisionNode::capture_loop, this);
         inference_thread_ = std::thread(&VisionNode::inference_loop, this);
         streaming_thread_ = std::thread(&VisionNode::streaming_loop, this);
-
-        RCLCPP_INFO(this->get_logger(), "Vision Node started (Dual-Stream V4L2 + YOLO + FFmpeg)");
     }
 
     ~VisionNode() {
         running_ = false;
         stream_cv_.notify_all();
         infer_cv_.notify_all();
-        
         if (capture_thread_.joinable()) capture_thread_.join();
         if (inference_thread_.joinable()) inference_thread_.join();
         if (streaming_thread_.joinable()) streaming_thread_.join();
-
         cleanup_v4l2();
 #ifdef HAS_TURBOJPEG
         if (tj_handle_) tjDestroy(tj_handle_);
@@ -104,42 +106,24 @@ public:
     }
 
 private:
-    struct Buffer {
-        void* start;
-        size_t length;
-    };
+    struct Buffer { void* start; size_t length; };
 
     bool init_v4l2() {
         fd_ = open(device_name_.c_str(), O_RDWR | O_NONBLOCK, 0);
         if (fd_ < 0) return false;
-
         struct v4l2_format fmt;
         memset(&fmt, 0, sizeof(fmt));
         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width = width_;
         fmt.fmt.pix.height = height_;
         fmt.fmt.pix.pixelformat = pixel_format_;
-        fmt.fmt.pix.field = V4L2_FIELD_ANY;
-
         ioctl(fd_, VIDIOC_S_FMT, &fmt);
-        width_ = fmt.fmt.pix.width;
-        height_ = fmt.fmt.pix.height;
-
-        struct v4l2_streamparm streamparm;
-        memset(&streamparm, 0, sizeof(streamparm));
-        streamparm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        streamparm.parm.capture.timeperframe.numerator = 1;
-        streamparm.parm.capture.timeperframe.denominator = fps_;
-        ioctl(fd_, VIDIOC_S_PARM, &streamparm);
-
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
         req.count = 4;
         req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         req.memory = V4L2_MEMORY_MMAP;
-
         if (ioctl(fd_, VIDIOC_REQBUFS, &req) < 0) return false;
-
         buffers_.resize(req.count);
         for (size_t i = 0; i < req.count; ++i) {
             struct v4l2_buffer buf;
@@ -152,7 +136,6 @@ private:
             buffers_[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buf.m.offset);
             ioctl(fd_, VIDIOC_QBUF, &buf);
         }
-
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(fd_, VIDIOC_STREAMON, &type);
         return true;
@@ -161,9 +144,7 @@ private:
     void cleanup_v4l2() {
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ioctl(fd_, VIDIOC_STREAMOFF, &type);
-        for (auto& buffer : buffers_) {
-            munmap(buffer.start, buffer.length);
-        }
+        for (auto& buffer : buffers_) munmap(buffer.start, buffer.length);
         if (fd_ >= 0) close(fd_);
     }
 
@@ -171,55 +152,46 @@ private:
         struct pollfd pfd;
         pfd.fd = fd_;
         pfd.events = POLLIN;
-
         while (running_ && rclcpp::ok()) {
-            int ret = poll(&pfd, 1, 1000);
-            if (ret <= 0) continue;
-
-            if (pfd.revents & POLLIN) {
-                struct v4l2_buffer buf;
-                memset(&buf, 0, sizeof(buf));
-                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                buf.memory = V4L2_MEMORY_MMAP;
-
-                if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) continue;
-
-                cv::Mat decoded_frame;
-                if (pixel_format_ == V4L2_PIX_FMT_YUYV) {
-                    cv::Mat yuyv(height_, width_, CV_8UC2, buffers_[buf.index].start);
-                    cv::cvtColor(yuyv, decoded_frame, cv::COLOR_YUV2BGR_YUYV);
-                } else if (pixel_format_ == V4L2_PIX_FMT_MJPEG) {
+            if (poll(&pfd, 1, 1000) <= 0) continue;
+            struct v4l2_buffer buf;
+            memset(&buf, 0, sizeof(buf));
+            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            buf.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) continue;
+            cv::Mat decoded_frame;
+            if (pixel_format_ == V4L2_PIX_FMT_YUYV) {
+                cv::Mat yuyv(height_, width_, CV_8UC2, buffers_[buf.index].start);
+                cv::cvtColor(yuyv, decoded_frame, cv::COLOR_YUV2BGR_YUYV);
+            } else if (pixel_format_ == V4L2_PIX_FMT_MJPEG) {
 #ifdef HAS_TURBOJPEG
-                    if (tj_handle_) {
-                        decoded_frame.create(height_, width_, CV_8UC3);
-                        tjDecompress2(tj_handle_, (unsigned char*)buffers_[buf.index].start, buf.bytesused,
-                                      decoded_frame.data, width_, 0, height_, TJPF_BGR, TJFLAG_FASTDCT);
-                    } else {
+                if (tj_handle_) {
+                    decoded_frame.create(height_, width_, CV_8UC3);
+                    tjDecompress2(tj_handle_, (unsigned char*)buffers_[buf.index].start, buf.bytesused,
+                                  decoded_frame.data, width_, 0, height_, TJPF_BGR, TJFLAG_FASTDCT);
+                } else {
 #endif
-                        std::vector<char> vec((char*)buffers_[buf.index].start, ((char*)buffers_[buf.index].start) + buf.bytesused);
-                        decoded_frame = cv::imdecode(vec, cv::IMREAD_COLOR);
+                    std::vector<char> vec((char*)buffers_[buf.index].start, ((char*)buffers_[buf.index].start) + buf.bytesused);
+                    decoded_frame = cv::imdecode(vec, cv::IMREAD_COLOR);
 #ifdef HAS_TURBOJPEG
-                    }
+                }
 #endif
-                }
-
-                if (!decoded_frame.empty()) {
-                    {
-                        std::lock_guard<std::mutex> lock(frame_mutex_);
-                        current_raw_frame_ = decoded_frame;
-                        new_frame_for_stream_ = true;
-                        new_frame_for_infer_ = true;
-                    }
-                    stream_cv_.notify_one();
-                    infer_cv_.notify_one();
-                }
-
-                ioctl(fd_, VIDIOC_QBUF, &buf);
             }
+            if (!decoded_frame.empty()) {
+                { std::lock_guard<std::mutex> lock(frame_mutex_); current_raw_frame_ = decoded_frame; new_frame_for_stream_ = true; new_frame_for_infer_ = true; }
+                stream_cv_.notify_one(); infer_cv_.notify_one();
+            }
+            ioctl(fd_, VIDIOC_QBUF, &buf);
         }
     }
 
     void inference_loop() {
+        // ONNX Runtime allocation
+        Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        const char* input_names[] = {"images"};
+        const char* output_names[] = {"output0"};
+        std::vector<int64_t> input_shape = {1, 3, 640, 640};
+
         while (running_ && rclcpp::ok()) {
             cv::Mat frame;
             {
@@ -229,147 +201,125 @@ private:
                 frame = current_raw_frame_.clone();
                 new_frame_for_infer_ = false;
             }
-
-            if (net_.empty() || frame.empty()) continue;
+            if (!model_loaded_ || frame.empty()) continue;
 
             try {
-                // YOLOv8/v11 Preprocessing: Square blob with letterbox-style resize
+                // Preprocessing
                 cv::Mat blob = cv::dnn::blobFromImage(frame, 1/255.0, cv::Size(640, 640), cv::Scalar(), true, false);
-                net_.setInput(blob);
-                std::vector<cv::Mat> outputs;
-                net_.forward(outputs, net_.getUnconnectedOutLayersNames());
+                
+                // Create Input Tensor
+                Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, blob.ptr<float>(), blob.total(), input_shape.data(), input_shape.size());
+
+                // Run Inference
+                auto output_tensors = session_->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, 1);
 
                 std::vector<Detection> detections;
-                if (!outputs.empty()) {
-                    cv::Mat out = outputs[0];
-                    // YOLO26n output is (1, 300, 6) -> [x1, y1, x2, y2, conf, class]
-                    if (out.dims == 3 && out.size[2] == 6) {
-                        int num_detections = out.size[1];
-                        
-                        float x_scale = (float)width_ / 640.0;
-                        float y_scale = (float)height_ / 640.0;
+                if (!output_tensors.empty()) {
+                    float* floatarr = output_tensors.front().GetTensorMutableData<float>();
+                    auto output_type_info = output_tensors.front().GetTensorTypeAndShapeInfo();
+                    auto out_shape = output_type_info.GetShape();
 
-                        for (int i = 0; i < num_detections; ++i) {
-                            float* data = out.ptr<float>(0, i);
-                            float confidence = data[4];
-                            int class_id = (int)data[5];
+                    float x_scale = (float)width_ / 640.0;
+                    float y_scale = (float)height_ / 640.0;
 
-                            if (confidence >= conf_threshold_) {
-                                float x1 = data[0] * x_scale;
-                                float y1 = data[1] * y_scale;
-                                float x2 = data[2] * x_scale;
-                                float y2 = data[3] * y_scale;
+                    if (out_shape.size() == 3 && out_shape[1] == 84 && out_shape[2] == 8400) {
+                        // Output is 1x84x8400
+                        cv::Mat raw_data(84, 8400, CV_32F, floatarr);
+                        cv::Mat data = raw_data.t(); // Transpose to 8400x84
 
-                                Detection d;
-                                d.box = cv::Rect(cv::Point(x1, y1), cv::Point(x2, y2));
-                                d.confidence = confidence;
-                                d.label = (class_id == 0) ? "person" : "object";
-                                detections.push_back(d);
+                        std::vector<int> class_ids;
+                        std::vector<float> confs;
+                        std::vector<cv::Rect> boxes;
 
-                                geometry_msgs::msg::Point p;
-                                p.x = (x1 + x2) / 2.0;
-                                p.y = (y1 + y2) / 2.0;
-                                p.z = confidence;
-                                target_pub_->publish(p);
+                        for (int i = 0; i < data.rows; ++i) {
+                            float* row = data.ptr<float>(i);
+                            cv::Mat scores(1, 80, CV_32F, row + 4);
+                            cv::Point class_id_p;
+                            double max_s;
+                            cv::minMaxLoc(scores, nullptr, &max_s, nullptr, &class_id_p);
+
+                            if (max_s >= conf_threshold_) {
+                                float w = row[2] * x_scale;
+                                float h = row[3] * y_scale;
+                                float left = row[0] * x_scale - w / 2;
+                                float top = row[1] * y_scale - h / 2;
+
+                                boxes.push_back(cv::Rect(left, top, w, h));
+                                confs.push_back((float)max_s);
+                                class_ids.push_back(class_id_p.x);
                             }
+                        }
+
+                        // NMS
+                        std::vector<int> indices;
+                        cv::dnn::NMSBoxes(boxes, confs, conf_threshold_, 0.45f, indices);
+                        for (int idx : indices) {
+                            Detection d;
+                            d.box = boxes[idx];
+                            d.confidence = confs[idx];
+                            d.label = (class_ids[idx] == 0) ? "person" : "object";
+                            detections.push_back(d);
+
+                            geometry_msgs::msg::Point p;
+                            p.x = d.box.x + d.box.width / 2.0;
+                            p.y = d.box.y + d.box.height / 2.0;
+                            p.z = d.confidence;
+                            target_pub_->publish(p);
                         }
                     }
                 }
 
-                {
-                    std::lock_guard<std::mutex> lock(boxes_mutex_);
-                    latest_detections_ = detections;
-                }
-            } catch (const cv::Exception& e) {
-                RCLCPP_ERROR(this->get_logger(), "OpenCV Inference Error: %s", e.what());
+                { std::lock_guard<std::mutex> lock(boxes_mutex_); latest_detections_ = detections; }
+
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(this->get_logger(), "ORT Inference Error: %s", e.what());
             }
         }
     }
 
     void streaming_loop() {
-        std::string ffmpeg_cmd = "ffmpeg -y -f rawvideo -pixel_format bgr24 -video_size " + 
-                                 std::to_string(width_) + "x" + std::to_string(height_) + 
-                                 " -framerate " + std::to_string(fps_) + 
-                                 " -i - -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p" + 
-                                 " -b:v 2000k -x264-params \"repeat-headers=1:rc-lookahead=0:keyint=60:no-scenecut=1:bframes=0\"" + 
-                                 " -f rtp " + rtp_url_ + " 2>/dev/null";
-
-        RCLCPP_INFO(this->get_logger(), "Starting FFmpeg stream: %s", ffmpeg_cmd.c_str());
+        std::string ffmpeg_cmd = "ffmpeg -y -f rawvideo -pixel_format bgr24 -video_size " + std::to_string(width_) + "x" + std::to_string(height_) + " -framerate " + std::to_string(fps_) + " -i - "
+    "-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p "
+    "-b:v 1200k -maxrate 1500k -bufsize 500k "
+    "-g 15 -x264-params \"slice-max-size=1400:intra-refresh=1:rc-lookahead=0:no-scenecut=1:bframes=0\" "
+    "-f rtp " + rtp_url_ + " 2>/dev/null";
         FILE* ffmpeg_pipe = popen(ffmpeg_cmd.c_str(), "w");
-        
-        if (!ffmpeg_pipe) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to open FFmpeg pipe!");
-            return;
-        }
-
+        if (!ffmpeg_pipe) return;
         while (running_ && rclcpp::ok()) {
             cv::Mat frame;
-            {
-                std::unique_lock<std::mutex> lock(frame_mutex_);
-                stream_cv_.wait(lock, [this]{ return new_frame_for_stream_ || !running_; });
-                if (!running_) break;
-                frame = current_raw_frame_.clone();
-                new_frame_for_stream_ = false;
-            }
-
-            // Draw bounding boxes on the streaming frame
-            std::vector<Detection> dets_to_draw;
-            {
-                std::lock_guard<std::mutex> lock(boxes_mutex_);
-                dets_to_draw = latest_detections_;
-            }
-
-            for (const auto& det : dets_to_draw) {
+            { std::unique_lock<std::mutex> lock(frame_mutex_); stream_cv_.wait(lock, [this]{ return new_frame_for_stream_ || !running_; }); if (!running_) break; frame = current_raw_frame_.clone(); new_frame_for_stream_ = false; }
+            std::vector<Detection> dets; { std::lock_guard<std::mutex> lock(boxes_mutex_); dets = latest_detections_; }
+            for (const auto& det : dets) {
                 cv::rectangle(frame, det.box, cv::Scalar(0, 255, 0), 2);
-                cv::putText(frame, det.label + " " + std::to_string(det.confidence).substr(0, 4), 
-                            cv::Point(det.box.x, std::max(0, det.box.y - 10)), 
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+                cv::putText(frame, det.label + " " + std::to_string(det.confidence).substr(0, 4), cv::Point(det.box.x, std::max(0, det.box.y - 10)), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
             }
-
-            // Publish annotated frame to ROS for debug
             auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
-            msg->header.stamp = this->now();
-            msg->header.frame_id = "camera_link";
-            image_pub_->publish(*msg);
-
-            // Write raw BGR bytes directly to FFmpeg
-            size_t written = fwrite(frame.data, 1, frame.total() * frame.elemSize(), ffmpeg_pipe);
-            if (written != frame.total() * frame.elemSize()) {
-                RCLCPP_WARN(this->get_logger(), "FFmpeg pipe write incomplete or broken.");
-            }
-            fflush(ffmpeg_pipe);
+            msg->header.stamp = this->now(); msg->header.frame_id = "camera_link"; image_pub_->publish(*msg);
+            fwrite(frame.data, 1, frame.total() * frame.elemSize(), ffmpeg_pipe); fflush(ffmpeg_pipe);
         }
-
         if (ffmpeg_pipe) pclose(ffmpeg_pipe);
     }
 
-    std::string device_name_;
-    int width_, height_, fps_;
+    std::string device_name_, rtp_url_;
+    int width_, height_, fps_, fd_;
     uint32_t pixel_format_;
     double conf_threshold_;
-    std::string rtp_url_;
-    int fd_;
     std::vector<Buffer> buffers_;
 #ifdef HAS_TURBOJPEG
     tjhandle tj_handle_ = nullptr;
 #endif
-
-    std::thread capture_thread_;
-    std::thread inference_thread_;
-    std::thread streaming_thread_;
+    std::thread capture_thread_, inference_thread_, streaming_thread_;
     std::atomic<bool> running_;
-
-    std::mutex frame_mutex_;
-    std::condition_variable stream_cv_;
-    std::condition_variable infer_cv_;
+    std::mutex frame_mutex_, boxes_mutex_;
+    std::condition_variable stream_cv_, infer_cv_;
     cv::Mat current_raw_frame_;
-    bool new_frame_for_stream_ = false;
-    bool new_frame_for_infer_ = false;
+    bool new_frame_for_stream_ = false, new_frame_for_infer_ = false;
+    
+    Ort::Env env_;
+    std::unique_ptr<Ort::Session> session_;
+    bool model_loaded_ = false;
 
-    cv::dnn::Net net_;
-    std::mutex boxes_mutex_;
     std::vector<Detection> latest_detections_;
-
     rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr target_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
 };

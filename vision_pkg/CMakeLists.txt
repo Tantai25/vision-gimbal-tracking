@@ -24,9 +24,11 @@ endif()
 add_executable(vision_node src/vision_node.cpp)
 target_include_directories(vision_node PRIVATE
   ${OpenCV_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/include
 )
 target_link_libraries(vision_node
   ${OpenCV_LIBRARIES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/lib/libonnxruntime.so
 )
 
 if(HAS_TURBOJPEG)
@@ -45,6 +47,11 @@ ament_target_dependencies(vision_node
 install(TARGETS
   vision_node
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY onnxruntime/lib/
+  DESTINATION lib
+  FILES_MATCHING PATTERN "*.so*"
 )
 
 ament_package()
